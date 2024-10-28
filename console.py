@@ -1,84 +1,75 @@
-import ctypes as ct
+import codecs
+import dataclasses
+import enum
 import logging
 import sys
+import typing as t
 
-import serial  # type: ignore
 from PyQt6 import QtCore, QtWidgets, uic
+from PyQt6.QtGui import QColor
+
+from console.connections.com_connection import COMConnection
+from console.connections.connection import Connection, Encoding
+from console.logging import MainWindowLogHandler
 
 # TODO Add command history
 
-MAX_COM_PORTS = 256
 MAIN_WINDOW_UI_PATH = './assets/main_window.ui'
-BAUD_RATES = (
-    50,
-    75,
-    110,
-    134,
-    150,
-    200,
-    300,
-    600,
-    1200,
-    1800,
-    2400,
-    4800,
-    9600,
-    19200,
-    38400,
-    57600,
-    115200)
 DEFAULT_BAUD_RATE = 9600
+DEFAULT_ENCODING = Encoding.ANSI
 SETTINGS_FILEPATH = './settings.ini'
 
-class MainWindowFormatter(logging.Formatter):
-    COLOR_MAP = {
-        logging.DEBUG: 'gray',
-        logging.INFO: 'black',
-        logging.WARNING: 'orange',
-        logging.ERROR: 'red'}
+class ReadbackType(enum.IntEnum):
+    READ_SIZE = 0
+    READ_UNTIL = 1
 
-    def __init__(self) -> None:
-        super().__init__('[%(levelname)s] [%(asctime)s] %(message)s')
+@dataclasses.dataclass
+class ReadbackMethod:
+    type: ReadbackType
+    data: t.Any
 
-    def format(self, record: logging.LogRecord) -> str:
-        main_text = super().format(record)
-        return f'<span style="color:{self.COLOR_MAP[record.levelno]}">{main_text}</span>'
+    @classmethod
+    def read_line(cls) -> t.Self:
+        return cls(ReadbackType.READ_UNTIL, '\n')
 
-class MainWindowLogHandler(logging.Handler):
-    def __init__(self, output: QtWidgets.QTextEdit) -> None:
-        super().__init__(0)
+    @classmethod
+    def read_size(cls, size: int) -> t.Self:
+        return cls(ReadbackType.READ_SIZE, size)
 
-        self.output = output
-        self.setFormatter(MainWindowFormatter())
+    @classmethod
+    def read_until(cls, char: str) -> t.Self:
+        return cls(ReadbackType.READ_UNTIL, char)
 
-    def emit(self, record: logging.LogRecord) -> None:
-        self.output.insertHtml(self.format(record))
-        self.output.insertPlainText('\n')
 
 class ReadbackThread(QtCore.QThread):
     message_received = QtCore.pyqtSignal(str)
+    readback_error = QtCore.pyqtSignal(str)
 
-    def __init__(self, _serial: serial.Serial) -> None:
+    def __init__(self, connection: Connection, readback_method: ReadbackMethod) -> None:
         super().__init__()
-        
-        self._serial = _serial
+
+        self.connection = connection
+        self.readback_method = readback_method
         self.is_running = False
-    
+
+    def _receive_text(self) -> str:
+        match self.readback_method.type:
+            case ReadbackType.READ_SIZE:
+                return self.connection.receive_text(self.readback_method.data)
+            case ReadbackType.READ_UNTIL:
+                return self.connection.receive_text_until(self.readback_method.data)
+            case _:
+                raise ValueError('Invalid readback method type.')
+
     def run(self) -> None:
         self.is_running = True
 
         while self.is_running:
-            # TODO Multiple readback methods
             try:
-                data = self._serial.readline()
-            except Exception: # FIXME Handle valid exception
-                # ignore exception when device disconnected
-                break
-            
-            # TODO Selectable encoding
-            decoded = data.decode('ansi')
-
-            self.message_received.emit(decoded)
+                self.message_received.emit(self._receive_text())
+            except Exception as e:
+                # FIXME Handle valid exception
+                self.readback_error.emit(str(e))
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
@@ -87,11 +78,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.button_connect: QtWidgets.QPushButton
         self.combo_baud_rate: QtWidgets.QComboBox
         self.combo_port: QtWidgets.QComboBox
-        self.frame_status_indicator: QtWidgets.QFrame
+        self.combo_encoding: QtWidgets.QComboBox
+        self.combo_readback_type: QtWidgets.QComboBox
         self.label_status: QtWidgets.QLabel
         self.button_send: QtWidgets.QPushButton
         self.line_edit_input: QtWidgets.QLineEdit
         self.text_output: QtWidgets.QTextEdit
+        self.widget_readback_data: QtWidgets.QStackedWidget
+        self.line_edit_readback_terminator: QtWidgets.QLineEdit
+        self.spin_readback_size: QtWidgets.QSpinBox
+        self.button_set_readback: QtWidgets.QPushButton
 
         # TODO Selectable optional int input (accepting list of integers instead of the message)
         self.use_int_input: bool = True
@@ -103,7 +99,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings = QtCore.QSettings(
             SETTINGS_FILEPATH,
             QtCore.QSettings.Format.IniFormat)
-        self.serial: serial.Serial | None = None
+        self.connection: Connection | None = None
+
+        # setup connection label
+        palette = self.label_status.palette()
+        palette.setColor(self.label_status.backgroundRole(), QColor('gray'))
+        self.label_status.setPalette(palette)
+
+        self.encoding = DEFAULT_ENCODING
+
+        # setup readback
+        self.button_set_readback.clicked.connect(self.set_readback_clicked_cb)
+
+        for _value in ReadbackType:
+            self.combo_readback_type.addItem(_value.name, _value)
+
+        self.combo_readback_type.setCurrentIndex(
+            self.combo_readback_type.findData(
+                ReadbackType(self.settings.value(
+                    'readback_type',
+                    ReadbackType.READ_SIZE.value,
+                    int))))
 
         # setup logger
         self.logger = logging.getLogger(__name__)
@@ -120,7 +136,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.button_connect.clicked.connect(self.connect_clicked_cb)
 
         # setup baud rate combo box
-        for baud_rate in BAUD_RATES:
+        for baud_rate in COMConnection.get_available_baud_rates():
             self.combo_baud_rate.addItem(str(baud_rate), baud_rate)
 
         self.combo_baud_rate.setCurrentIndex(
@@ -133,7 +149,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.baud_rate_changed_cb)
 
         # setup port combo box
-        com_ports = get_connected_com_ports()
+        com_ports = COMConnection.get_available_ports()
         if len(com_ports) != 0:
             for port in com_ports:
                 self.combo_port.addItem(port, port)
@@ -147,6 +163,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self.button_connect.setEnabled(False)
 
         self.combo_port.currentIndexChanged.connect(self.port_changed_cb)
+
+        # setup encoding combo box
+        self.combo_encoding.currentIndexChanged.connect(self.encoding_changed_cb)
+        for value in Encoding:
+            self.combo_encoding.addItem(value.name, value.value)
+
+        default_encoding: str | None = self.settings.value('encoding', DEFAULT_ENCODING.value, str)
+        if default_encoding:
+            self.combo_encoding.setCurrentIndex(self.combo_encoding.findData(default_encoding))
 
     def set_connection_status(self, status: str) -> None:
         self.label_status.setText(status)
@@ -163,14 +188,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self.combo_port.setEnabled(not is_connected)
 
         if is_connected:
+            assert self.connection is not None, 'Connection should be estabilished by now'
+
+            palette = self.label_status.palette()
+            palette.setColor(self.label_status.backgroundRole(), QColor('green'))
+            self.label_status.setPalette(palette)
+
             self.button_connect.clicked.disconnect(self.connect_clicked_cb)
             self.button_connect.clicked.connect(self.disconnect_clicked_cb)
             self.line_edit_input.returnPressed.connect(self.send_action_cb)
 
-            self.readback_thread = ReadbackThread(self.serial)
+            readback_method = ReadbackMethod(
+                self.combo_readback_type.currentData(),
+                self.get_current_readback_data())
+
+            self.readback_thread = ReadbackThread(
+                self.connection,
+                readback_method)
             self.readback_thread.message_received.connect(self.message_received_cb)
             self.readback_thread.start()
         else:
+            palette = self.label_status.palette()
+            palette.setColor(self.label_status.backgroundRole(), QColor('gray'))
+            self.label_status.setPalette(palette)
+
             self.button_connect.clicked.disconnect(self.disconnect_clicked_cb)
             self.button_connect.clicked.connect(self.connect_clicked_cb)
             self.line_edit_input.returnPressed.disconnect(self.send_action_cb)
@@ -181,9 +222,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.readback_thread.message_received.disconnect(self.message_received_cb)
 
                 self.readback_thread = None
-    
+
+    def get_current_readback_data(self) -> t.Any:
+        current_index = self.widget_readback_data.currentIndex()
+        match current_index:
+            case 0:
+                return self.spin_readback_size.value()
+            case 1:
+                return self.line_edit_readback_terminator.text()
+
+        raise RuntimeError('Invalid readback data widget set.')
+
     def send_bytes(self, text: str, data: bytes) -> None:
-        sent_bytes = self.serial.write(data)
+        assert self.connection is not None, 'Connection is not estabilished'
+
+        sent_bytes = self.connection.send(data)
+
         if sent_bytes is None:
             self.logger.error('Failed to sent COM message.')
         elif sent_bytes != len(data):
@@ -193,7 +247,34 @@ class MainWindow(QtWidgets.QMainWindow):
                 'Host -> %s (%d bytes)',
                 text,
                 len(data))
-    
+
+    def set_readback_method(self) -> None:
+        readback_type: ReadbackType = self.combo_readback_type.currentData()
+        readback_data = self.get_current_readback_data()
+
+        if isinstance(readback_data, str):
+            readback_data = codecs.decode(readback_data, 'unicode-escape')
+
+        if self.readback_thread is not None:
+            self.readback_thread.readback_method = ReadbackMethod(readback_type, readback_data)
+
+        self.settings.setValue('readback_type', readback_type.value)
+        self.settings.setValue('readback_data', readback_data)
+        self.widget_readback_data.setCurrentIndex(readback_type.value)
+
+    @QtCore.pyqtSlot()
+    def set_readback_clicked_cb(self) -> None:
+        self.set_readback_method()
+
+    @QtCore.pyqtSlot(int)
+    def encoding_changed_cb(self, index: int) -> None:
+        encoding = self.combo_encoding.itemData(index)
+        self.settings.setValue('encoding', encoding)
+
+        self.encoding = Encoding(encoding)
+        if self.connection is not None:
+            self.connection.encoding = Encoding(encoding)
+
     @QtCore.pyqtSlot(str)
     def message_received_cb(self, msg: str) -> None:
         self.logger.info('Device -> "%s" (%d chars)', msg, len(msg))
@@ -201,14 +282,13 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot()
     def send_action_cb(self) -> None:
         command_text = self.line_edit_input.text()
+        self.line_edit_input.clear()
 
         try:
             data = bytearray(int(x.strip()) for x in command_text.split(','))
         except ValueError as e:
             self.logger.error('Failed to encode int message %s: %s.', command_text, e)
             return
-
-        self.line_edit_input.clear()
 
         self.send_bytes(command_text, data)
 
@@ -217,7 +297,7 @@ class MainWindow(QtWidgets.QMainWindow):
         command_text = self.line_edit_input.text()
         self.line_edit_input.clear()
 
-        self.send_bytes(command_text, command_text.encode('ascii'))        
+        self.send_bytes(command_text, command_text.encode('ascii'))
 
     @QtCore.pyqtSlot(int)
     def baud_rate_changed_cb(self, _: int) -> None:
@@ -232,16 +312,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.settings.setValue('port', port)
 
+    @QtCore.pyqtSlot(str)
+    def readback_error_cb(self, message: str) -> None:
+        self.logger.error('Readback error: %s', message)
+
     @QtCore.pyqtSlot()
     def connect_clicked_cb(self) -> None:
-        port: str | None = self.combo_port.currentData()
+        port: str = self.combo_port.currentData()
         baud_rate: int = self.combo_baud_rate.currentData()
 
-        assert port is not None, 'Port cannot be None'
-
         try:
-            self.serial = serial.Serial(port, baud_rate)
-        except serial.SerialException as e:
+            self.connection = COMConnection(port, baud_rate, self.encoding)
+        except Exception as e:
             self.logger.error('Failed to connect to COM device: %s', e)
             return
 
@@ -254,43 +336,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot()
     def disconnect_clicked_cb(self) -> None:
-        assert self.serial is not None, 'Serial device cannot be None'
+        assert self.connection is not None, 'Connection is not estabilished'
 
-        self.serial.close()
-        self.serial = None
+        self.connection.close()
+        self.connection = None
 
         self.set_connected_status(False)
 
         self.logger.info('Disconnected from COM port.')
-
-def get_connected_com_ports() -> list[str]:
-    com_ports = (ct.c_ulong * MAX_COM_PORTS)()
-    com_ports_found = ct.c_ulong(0)
-
-    try:
-        GetCommPorts(com_ports, MAX_COM_PORTS, ct.pointer(com_ports_found))
-    except RuntimeError:
-        return []
-
-    result = list[str]()
-    for i in range(com_ports_found.value):
-        result.append(f'COM{com_ports[i]}')
-
-    return result
-
-def get_comm_ports_errcheck(result: ct.c_ulong, *_) -> ct.c_ulong:
-    if result != 0:
-        raise RuntimeError('Failed to retrieve connected COM ports.')
-
-    return result
-
-GetCommPorts = ct.WinDLL('KernelBase.dll').GetCommPorts # type: ignore
-GetCommPorts.restype = ct.c_ulong
-GetCommPorts.argtypes = (
-    ct.POINTER(ct.c_ulong),
-    ct.c_ulong,
-    ct.POINTER(ct.c_ulong))
-GetCommPorts.errcheck = get_comm_ports_errcheck # type: ignore
 
 if __name__ == '__main__':
     app = QtWidgets.QApplication(sys.argv)
