@@ -5,6 +5,8 @@ import sys
 import serial  # type: ignore
 from PyQt6 import QtCore, QtWidgets, uic
 
+# TODO Add command history
+
 MAX_COM_PORTS = 256
 MAIN_WINDOW_UI_PATH = './assets/main_window.ui'
 BAUD_RATES = (
@@ -53,6 +55,31 @@ class MainWindowLogHandler(logging.Handler):
         self.output.insertHtml(self.format(record))
         self.output.insertPlainText('\n')
 
+class ReadbackThread(QtCore.QThread):
+    message_received = QtCore.pyqtSignal(str)
+
+    def __init__(self, _serial: serial.Serial) -> None:
+        super().__init__()
+        
+        self._serial = _serial
+        self.is_running = False
+    
+    def run(self) -> None:
+        self.is_running = True
+
+        while self.is_running:
+            # TODO Multiple readback methods
+            try:
+                data = self._serial.readline()
+            except Exception: # FIXME Handle valid exception
+                # ignore exception when device disconnected
+                break
+            
+            # TODO Selectable encoding
+            decoded = data.decode('ansi')
+
+            self.message_received.emit(decoded)
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -65,6 +92,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.button_send: QtWidgets.QPushButton
         self.line_edit_input: QtWidgets.QLineEdit
         self.text_output: QtWidgets.QTextEdit
+
+        # TODO Selectable optional int input (accepting list of integers instead of the message)
+        self.use_int_input: bool = True
+
+        self.readback_thread: ReadbackThread | None = None
 
         uic.load_ui.loadUi(MAIN_WINDOW_UI_PATH, self)
 
@@ -134,20 +166,58 @@ class MainWindow(QtWidgets.QMainWindow):
             self.button_connect.clicked.disconnect(self.connect_clicked_cb)
             self.button_connect.clicked.connect(self.disconnect_clicked_cb)
             self.line_edit_input.returnPressed.connect(self.send_action_cb)
+
+            self.readback_thread = ReadbackThread(self.serial)
+            self.readback_thread.message_received.connect(self.message_received_cb)
+            self.readback_thread.start()
         else:
             self.button_connect.clicked.disconnect(self.disconnect_clicked_cb)
             self.button_connect.clicked.connect(self.connect_clicked_cb)
             self.line_edit_input.returnPressed.disconnect(self.send_action_cb)
 
+            if self.readback_thread is not None:
+                self.readback_thread.is_running = False
+                self.readback_thread.wait()
+                self.readback_thread.message_received.disconnect(self.message_received_cb)
+
+                self.readback_thread = None
+    
+    def send_bytes(self, text: str, data: bytes) -> None:
+        sent_bytes = self.serial.write(data)
+        if sent_bytes is None:
+            self.logger.error('Failed to sent COM message.')
+        elif sent_bytes != len(data):
+            self.logger.warning('Not all bytes sent (%d/%d bytes).', sent_bytes, len(data))
+        else:
+            self.logger.info(
+                'Host -> %s (%d bytes)',
+                text,
+                len(data))
+    
+    @QtCore.pyqtSlot(str)
+    def message_received_cb(self, msg: str) -> None:
+        self.logger.info('Device -> "%s" (%d chars)', msg, len(msg))
+
     @QtCore.pyqtSlot()
     def send_action_cb(self) -> None:
         command_text = self.line_edit_input.text()
+
+        try:
+            data = bytearray(int(x.strip()) for x in command_text.split(','))
+        except ValueError as e:
+            self.logger.error('Failed to encode int message %s: %s.', command_text, e)
+            return
+
         self.line_edit_input.clear()
 
-        self.logger.info(
-            'Host -> %s (%d bytes)',
-            command_text,
-            len(command_text.encode('ascii')))
+        self.send_bytes(command_text, data)
+
+    @QtCore.pyqtSlot()
+    def _send_action_cb(self) -> None:
+        command_text = self.line_edit_input.text()
+        self.line_edit_input.clear()
+
+        self.send_bytes(command_text, command_text.encode('ascii'))        
 
     @QtCore.pyqtSlot(int)
     def baud_rate_changed_cb(self, _: int) -> None:
