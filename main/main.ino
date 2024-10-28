@@ -5,32 +5,87 @@
 
 #define SERIAL_RATE 9600
 
-// pins
-#define ENG_LEFT      9
-#define ENG_RIGHT     10
-#define ENG_LEFT_DIR 3
-#define ENG_RIGHT_DIR  2
+#define GET_OPCODE(x) ((x) & 127)
+#define HAS_CONT_BIT(x) ((x) & (1 << 7))
 
-// commands
-#define COM_SET_SPEED 1
-#define COM_SET_DIR   2
+#define ENG_SET_NO_DIR 1
+#define ENG_SET_NO_SPEED 2
 
 static hd44780_I2Cexp lcd(0x20, I2Cexp_MCP23008, 7, 6, 5, 4, 3, 2, 1, HIGH);
 
+// 0b0 0000000
+//   ^ ------- opcode
+//   continuation bit
 // instruction structure: opcode[byte], args count[byte], args[byte]...
+
+enum Opcode : uint8_t
+{
+  COM_SET_SPEED = 1,
+  COM_SET_DIR = 2,
+  COM_STOP = 3,
+  COM_GET_STATE = 4,
+  COM_PRINT_LCD = 5,
+};
+
+enum Direction : uint8_t
+{
+  DIR_BACKWARD = 0,
+  DIR_FORWARD = 255,
+};
+
+enum Engine
+{
+  ENGINE_LEFT = 0,
+  ENGINE_RIGHT = 1,
+};
+
 struct SerialCommand
 {
-    uint8_t opcode;
-    uint8_t argsCount;
-    uint8_t args[16];
+  Opcode opcode;
+  uint8_t argsCount;
+  uint8_t args[16];
 };
+
+struct EngineState
+{
+  uint8_t speed;
+  Direction direction;
+};
+
+struct TankState
+{
+  union {
+    struct
+    {
+      // Don't change order
+      EngineState engineLeft;
+      EngineState engineRight;
+    };
+    EngineState engines[2];
+  } engineStates;
+};
+
+struct TankConfig
+{
+  uint8_t engineSelectors[2];
+  uint8_t directionSelectors[2];
+};
+
+static TankState s_State;
+static TankConfig s_Config;
+static uint8_t s_LcdCursorPos = 0;
 
 void setup()
 {
-  pinMode(ENG_LEFT, OUTPUT);
-  pinMode(ENG_RIGHT, OUTPUT);
-  pinMode(ENG_LEFT_DIR, OUTPUT);
-  pinMode(ENG_RIGHT_DIR, OUTPUT);
+  s_Config.engineSelectors[ENGINE_LEFT] = 9;
+  s_Config.engineSelectors[ENGINE_RIGHT] = 10;
+  s_Config.directionSelectors[ENGINE_LEFT] = 3;
+  s_Config.directionSelectors[ENGINE_RIGHT] = 2;
+
+  pinMode(9, OUTPUT);
+  pinMode(10, OUTPUT);
+  pinMode(3, OUTPUT);
+  pinMode(2, OUTPUT);
   
   Serial.begin(SERIAL_RATE);
 
@@ -43,6 +98,27 @@ uint8_t readByteIfAvailable()
   while (!Serial.available()) { }
   
   return Serial.read();
+}
+
+void engineSetState(Engine engine, const EngineState* newState, uint8_t settings)
+{
+  if ((settings & ENG_SET_NO_DIR) != ENG_SET_NO_DIR)
+  {
+    const uint8_t output = s_Config.directionSelectors[engine];
+    const uint8_t direction = newState->direction;
+    digitalWrite(output, direction);
+
+    s_State.engineStates.engines[engine].direction = direction;
+  }
+  
+  if ((settings & ENG_SET_NO_SPEED) != ENG_SET_NO_SPEED)
+  {
+    const uint8_t output = s_Config.engineSelectors[engine];
+    const uint8_t speed = newState->speed;
+    analogWrite(output, speed);
+
+    s_State.engineStates.engines[engine].speed = speed;
+  }
 }
 
 void loop()
@@ -60,7 +136,7 @@ void loop()
     for (size_t i = 0; i < com.argsCount; i++)
       com.args[i] = readByteIfAvailable();
     
-    switch (com.opcode)
+    switch (GET_OPCODE(com.opcode))
     {
     case COM_SET_SPEED:
     {
@@ -70,16 +146,12 @@ void loop()
         break;
       }
 
-      const uint8_t engineNum = com.args[0];
-      const uint8_t engineSpeed = com.args[1];
+      const uint8_t engine = com.args[0];
+      EngineState state = {0};
+      state.speed = com.args[1];
+      engineSetState(engine, &state, ENG_SET_NO_DIR);
 
-      analogWrite(engineNum, engineSpeed);
-
-      Serial.write("[Status] Executed COM_SET_SPEED, args: ");
-      Serial.write(engineNum);
-      Serial.write(" ");
-      Serial.write(engineSpeed);
-      Serial.write("\n");
+      Serial.write("[Status] Executed COM_SET_SPEED\n");
       
       break;
     }
@@ -91,17 +163,62 @@ void loop()
         break;
       }
 
-      const uint8_t dirPortNum = com.args[0];
-      const uint8_t dir = com.args[1];
+      const uint8_t engine = com.args[1];
+      EngineState state = {0};
+      state.direction = (Direction)com.args[1];
+      engineSetState(engine, &state, ENG_SET_NO_SPEED);
 
-      digitalWrite(dirPortNum, dir);
-
-      Serial.write("[Status] Executed COM_SET_DIR, args: ");
-      Serial.write(dirPortNum);
-      Serial.write(" ");
-      Serial.write(dir);
-      Serial.write("\n");
+      Serial.write("[Status] Executed COM_SET_DIR.\n");
       
+      break;
+    }
+    case COM_STOP:
+    {
+      analogWrite(9, 0);
+      analogWrite(10, 0);
+      Serial.write("[Status] Executed COM_STOP.\n");
+      break;
+    }
+    case COM_GET_STATE:
+    {
+      Serial.write("[Status] Executed COM_GET_STATE.\n");
+
+      Serial.write("[State] Eng. left (spd: ");
+      Serial.write(s_State.engineStates.engineLeft.speed);
+      Serial.write(", dir: ");
+      Serial.write(s_State.engineStates.engineLeft.direction);
+      Serial.write(") ");
+      Serial.write("Eng. right (spd: ");
+      Serial.write(s_State.engineStates.engineRight.speed);
+      Serial.write(", dir: ");
+      Serial.write(s_State.engineStates.engineRight.direction);
+      Serial.write("\n");
+
+      break;
+    }
+    case COM_PRINT_LCD:
+    {
+      if (!HAS_CONT_BIT(com.opcode))
+      {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        s_LcdCursorPos = 0;
+      }
+      
+      for (uint8_t i = 0; i < com.argsCount; i++)
+      {
+        char character = (char)com.args[i];
+        if (character == '\n')
+        {
+          s_LcdCursorPos++;
+          lcd.setCursor(s_LcdCursorPos, 0);
+        }
+        else
+        {
+          lcd.print(character);
+        }
+      }
+
       break;
     }
     default:
@@ -109,10 +226,4 @@ void loop()
       Serial.write(com.opcode);
       Serial.write("\n");
     }
-
-    lcd.clear();
-    lcd.setCursor(0, 0);
-
-    lcd.print("E1 spd: %d, dir: (F|B)");
-    lcd.print(
 }
