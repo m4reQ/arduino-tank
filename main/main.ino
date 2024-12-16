@@ -1,270 +1,282 @@
-#include <stdint.h>
 #include <Wire.h>
+#include <Servo.h>
+#include <HCSR04.h>
 #include <hd44780.h>
 #include <hd44780ioClass/hd44780_I2Cexp.h>
 
+#define _countof(x) (sizeof(x) / sizeof(x[0]))
+
+#define HAS_CONT_BIT(x) (x & 0b10000000)
+#define GET_OPCODE(x) (x & 0b01111111)
+
+#define PIN_ENG_SPD_LEFT 10
+#define PIN_ENG_SPD_RIGHT 9
+#define PIN_ENG_DIR_LEFT 3
+#define PIN_ENG_DIR_RIGHT 2
+#define PIN_SENSOR_LEFT 15
+#define PIN_SENSOR_RIGHT 14
+#define PIN_SENSOR_REAR 36
+#define PIN_HEAD_SENSOR_SERVO 17
+#define PIN_HEAD_SENSOR_TRIGGER 7
+#define PIN_HEAD_SENSOR_ECHO 8
+#define LCD_WIDTH 16
+#define LCD_HEIGHT 2
+
 #define SERIAL_RATE 9600
+#define BT_SERIAL_RATE 115200
 
-#define GET_OPCODE(x) ((x) & 127)
-#define HAS_CONT_BIT(x) ((x) & (1 << 7))
-
-#define ENG_SET_NO_DIR 1
-#define ENG_SET_NO_SPEED 2
-
-static hd44780_I2Cexp lcd(0x20, I2Cexp_MCP23008, 7, 6, 5, 4, 3, 2, 1, HIGH);
-
-// 0b0 0000000
-//   ^ ------- opcode
-//   continuation bit
-// instruction structure: opcode[byte], args count[byte], args[byte]...
-
-enum Opcode : uint8_t
+typedef enum
 {
-  COM_SET_SPEED = 1,
-  COM_SET_DIR = 2,
-  COM_STOP = 3,
-  COM_GET_STATE = 4,
-  COM_PRINT_LCD = 5,
-  COM_CONFIGURE = 6,
-};
+    DIR_BACKWARD = 0b00,
+    DIR_FORWARD = 0b11,
+    DIR_LEFT = 0b01,
+    DIR_RIGHT = 0b10,
+    DIR_CURRENT = 0b11111111,
+} Direction;
 
-enum Direction : uint8_t
+typedef enum
 {
-  DIR_BACKWARD = 0,
-  DIR_FORWARD = 255,
-};
+    ENGINE_LEFT = 0,
+    ENGINE_RIGHT = 1,
+} Engine;
 
-enum Engine
+typedef enum
 {
-  ENGINE_LEFT = 0,
-  ENGINE_RIGHT = 1,
-};
+    SENSOR_LEFT = 0,
+    SENSOR_RIGHT = 1,
+    SENSOR_BACK = 2,
+} Sensor;
 
-struct SerialCommand
+typedef enum
 {
-  Opcode opcode;
-  uint8_t argsCount;
-  uint8_t args[16];
-};
+    STATUS_SUCCESS = 0,
+    STATUS_INV_OPCODE = 1,
+    STATUS_INV_ARGS_COUNT = 2,
+    STATUS_INV_STATE = 3,
+} Status;
 
-struct EngineState
+typedef enum
 {
-  uint8_t speed;
-  Direction direction;
-};
+    OP_MOVE = 1,
+    OP_STOP = 2,
+    OP_PRINT_LCD = 3,
+    OP_GET_SENSOR_STATE = 4,
+    OP_MOVE_HEAD_SENSOR = 5,
+} Opcode;
 
-struct TankState
+#pragma push(pack, 1)
+typedef struct
 {
-  union
-  {
-    struct
+    uint8_t opcode; // use `Opcode` enum
+    uint64_t id;
+    uint8_t status; // use `Status` enum
+    uint8_t dataLength;
+} Result;
+
+typedef struct
+{
+    uint8_t opcode; // use `Opcode` enum
+    uint64_t id;
+    uint8_t argsCount;
+    uint8_t args[16];
+} Command;
+
+typedef struct
+{
+    uint8_t opcode;
+    uint64_t id;
+    uint8_t argsCount;
+} CommandHeader;
+
+typedef struct
+{
+    Direction currentDir;
+    uint8_t currentSpeed;
+} EngineState;
+
+typedef struct
+{
+    uint8_t sensorLeft;
+    uint8_t sensorRight;
+    uint8_t sensorRear;
+    uint8_t headDistanceMm;
+} SensorState;
+#pragma pop
+
+static EngineState s_EngineState;
+static uint8_t s_LcdCursorY = 0;
+static hd44780_I2Cexp s_Lcd(0x20, I2Cexp_MCP23008, 7, 6, 5, 4, 3, 2, 1, HIGH);
+static Servo s_Servo;
+
+static bool tryAcceptCommand(Command *command)
+{
+    // value returned by this function doesn't indicate success or failure, rather request
+    // that main loop should continue or not
+
+    if (Serial.available() < sizeof(CommandHeader))
+        return false;
+
+    Serial.readBytes((uint8_t *)command, sizeof(CommandHeader));
+
+    // assume instruction was completely sent and all arguments will be valid
+    size_t argsSize = command->argsCount * sizeof(uint8_t);
+    if (argsSize > 0)
+        Serial.readBytes((uint8_t *)command->args, argsSize);
+
+    return true;
+}
+
+static void sendResult(
+    const Command *command,
+    Status status,
+    const void *data,
+    uint8_t dataLength)
+{
+    const Result result = {
+        .opcode = command->opcode,
+        .id = command->id,
+        .status = (uint8_t)status,
+        .dataLength = dataLength};
+
+    Serial.write((const uint8_t *)&result, sizeof(Result));
+
+    if (dataLength > 0 && data != NULL)
+        Serial.write((const uint8_t *)data, dataLength);
+}
+
+static bool checkArgsCount(const Command *command, uint8_t expected)
+{
+    if (command->argsCount == expected)
+        return true;
+
+    sendResult(command, STATUS_INV_ARGS_COUNT, &expected, sizeof(uint8_t));
+    return false;
+}
+
+static void configureEngine(Direction direction, uint8_t speed)
+{
+    if (direction == DIR_CURRENT)
+        direction = s_EngineState.currentDir;
+
+    uint8_t dirLeft = (direction & 0b10) >> 1;
+    uint8_t dirRight = direction & 0b01;
+
+    digitalWrite(PIN_ENG_DIR_LEFT, dirLeft);
+    analogWrite(PIN_ENG_SPD_LEFT, speed);
+
+    digitalWrite(PIN_ENG_DIR_RIGHT, dirRight);
+    analogWrite(PIN_ENG_SPD_RIGHT, speed);
+
+    s_EngineState.currentDir = direction;
+    s_EngineState.currentSpeed = speed;
+}
+
+static void printLcd(const uint8_t *characters, uint8_t count, bool clear)
+{
+    if (clear)
     {
-      // Don't change order
-      EngineState engineLeft;
-      EngineState engineRight;
-    };
-    EngineState engines[2];
-  } engineStates;
-};
+        s_Lcd.clear();
+        s_Lcd.setCursor(0, 0);
 
-struct TankConfig
-{
-  uint8_t engineSelectors[2];
-  uint8_t directionSelectors[2];
-};
+        s_LcdCursorY = 0;
+    }
 
-static TankState s_State;
-static TankConfig s_Config;
-static uint8_t s_LcdCursorPos = 0;
+    for (uint8_t i = 0; i < count; i++)
+    {
+        char character = (char)characters[i];
+        if (character == '\n')
+        {
+            s_LcdCursorY++;
+            s_Lcd.setCursor(0, s_LcdCursorY);
+        }
+        else
+        {
+            s_Lcd.write(characters[i]);
+        }
+    }
+}
 
 void setup()
 {
-  Serial.begin(SERIAL_RATE);
-}
+    // configure serial for bluetooth
+    Serial.begin(BT_SERIAL_RATE);
 
-uint8_t readByteIfAvailable()
-{
-  // busy wait for serial available
-  while (!Serial.available())
-  {
-  }
+    // configure engines (speed and direction)
+    pinMode(PIN_ENG_SPD_LEFT, OUTPUT);
+    pinMode(PIN_ENG_SPD_RIGHT, OUTPUT);
+    pinMode(PIN_ENG_DIR_LEFT, OUTPUT);
+    pinMode(PIN_ENG_DIR_RIGHT, OUTPUT);
 
-  return Serial.read();
-}
+    // configure and clear screen
+    s_Lcd.begin(LCD_WIDTH, LCD_HEIGHT);
+    s_Lcd.clear();
 
-void engineSetState(Engine engine, const EngineState *newState, uint8_t settings)
-{
-  if ((settings & ENG_SET_NO_DIR) != ENG_SET_NO_DIR)
-  {
-    const uint8_t output = s_Config.directionSelectors[engine];
-    const uint8_t direction = newState->direction;
-    digitalWrite(output, direction);
+    // configure sensor pins
+    pinMode(PIN_SENSOR_LEFT, INPUT);
+    pinMode(PIN_SENSOR_RIGHT, INPUT);
+    pinMode(PIN_SENSOR_REAR, INPUT);
 
-    s_State.engineStates.engines[engine].direction = direction;
-  }
+    // configure head sensor
+    s_Servo.attach(PIN_HEAD_SENSOR_SERVO);
+    s_Servo.write(90);
 
-  if ((settings & ENG_SET_NO_SPEED) != ENG_SET_NO_SPEED)
-  {
-    const uint8_t output = s_Config.engineSelectors[engine];
-    const uint8_t speed = newState->speed;
-    analogWrite(output, speed);
-
-    s_State.engineStates.engines[engine].speed = speed;
-  }
-}
-
-void handleComSetSpeed(const SerialCommand &command)
-{
-  if (command->argsCount != 2)
-  {
-    Serial.write("[Status] COM_SET_SPEED Invalid command length.\n");
-    return;
-  }
-
-  const uint8_t engine = command->args[0];
-  EngineState state = {0};
-  state.speed = command->args[1];
-  engineSetState(engine, &state, ENG_SET_NO_DIR);
-
-  Serial.write("[Status] Executed COM_SET_SPEED\n");
-}
-
-void handleComSetDir(const SerialCommand &command)
-{
-  if (command->argsCount != 2)
-  {
-    Serial.write("[Status] COM_SET_DIR Invalid command length.\n");
-    return;
-  }
-
-  const uint8_t engine = command->args[1];
-  EngineState state = {0};
-  state.direction = (Direction)command->args[1];
-  engineSetState(engine, &state, ENG_SET_NO_SPEED);
-
-  Serial.write("[Status] Executed COM_SET_DIR.\n");
-}
-
-void handleComStop()
-{
-  analogWrite(9, 0);
-  analogWrite(10, 0);
-  Serial.write("[Status] Executed COM_STOP.\n");
-}
-
-void handleComGetState()
-{
-  Serial.write("[State] Eng. left (spd: ");
-  Serial.write(s_State.engineStates.engineLeft.speed);
-  Serial.write(", dir: ");
-  Serial.write(s_State.engineStates.engineLeft.direction);
-  Serial.write(") ");
-  Serial.write("Eng. right (spd: ");
-  Serial.write(s_State.engineStates.engineRight.speed);
-  Serial.write(", dir: ");
-  Serial.write(s_State.engineStates.engineRight.direction);
-  Serial.write("\n");
-
-  Serial.write("[Status] Executed COM_GET_STATE.\n");
-}
-
-void handleComPrintLcd(const SerialCommand *command)
-{
-  if (!HAS_CONT_BIT(command->opcode))
-  {
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    s_LcdCursorPos = 0;
-  }
-
-  for (uint8_t i = 0; i < command->argsCount; i++)
-  {
-    char character = (char)command->args[i];
-    if (character == '\n')
-    {
-      s_LcdCursorPos++;
-      lcd.setCursor(s_LcdCursorPos, 0);
-    }
-    else
-    {
-      lcd.print(character);
-    }
-  }
-
-  Serial.write("[Status] Executed COM_PRINT_LCD.\n");
-}
-
-void handleComConfigure(const SerialCommand *command)
-{
-  if (command->argsCount < 6)
-  {
-    Serial.write("[Status] COM_CONFIGURE expected 7 arguments.\n");
-    return;
-  }
-
-  // COM_CONFIGURE args:
-  // 0 -> engineSelector[left]
-  // 1 -> engineSelector[right]
-  // 2 -> directionSelector[left]
-  // 3 -> directionSelector[right]
-  // 4 -> lcd width
-  // 5 -> lcd height
-
-  s_Config.engineSelectors[ENGINE_LEFT] = command->args[0];
-  pinMode(command->args[0], OUTPUT);
-
-  s_Config.engineSelectors[ENGINE_RIGHT] = command->args[1];
-  pinMode(command->args[1], OUTPUT);
-
-  s_Config.directionSelectors[ENGINE_LEFT] = command->args[2];
-  pinMode(command->args[2], OUTPUT);
-
-  s_Config.directionSelectors[ENGINE_RIGHT] = command->args[3];
-  pinMode(command->args[3], OUTPUT);
-
-  lcd.begin(command->args[4], command->args[5]);
-
-  Serial.write("[Status] Executed COM_CONFIGURE.\n");
+    uint8_t sensorEchoPin = PIN_HEAD_SENSOR_ECHO;
+    HCSR04.begin(PIN_HEAD_SENSOR_TRIGGER, &sensorEchoPin, 1);
 }
 
 void loop()
 {
-  SerialCommand com = {0};
-  com.opcode = readByteIfAvailable();
-  com.argsCount = readByteIfAvailable();
+    Command com;
+    if (!tryAcceptCommand(&com))
+        return;
 
-  if (com.argsCount > 16)
-  {
-    Serial.write("[Status] Max arguments count exceeded. Max is 16.\n");
-    return;
-  }
+    switch (GET_OPCODE(com.opcode))
+    {
+    case OP_MOVE:
+    {
+        if (!checkArgsCount(&com, 2))
+            return;
 
-  for (size_t i = 0; i < com.argsCount; i++)
-    com.args[i] = readByteIfAvailable();
+        configureEngine((Direction)com.args[0], com.args[1]);
+        break;
+    }
+    case OP_STOP:
+    {
+        configureEngine(DIR_FORWARD, 0);
+        break;
+    }
+    case OP_PRINT_LCD:
+    {
+        printLcd(com.args, com.argsCount, HAS_CONT_BIT(com.opcode));
+        break;
+    }
+    case OP_GET_SENSOR_STATE:
+    {
+        SensorState sensorState = {
+            .sensorLeft = (uint8_t)digitalRead(PIN_SENSOR_LEFT),
+            .sensorRight = (uint8_t)digitalRead(PIN_SENSOR_RIGHT),
+            .sensorRear = (uint8_t)digitalRead(PIN_SENSOR_REAR),
+            .headDistanceMm = (uint8_t)HCSR04.measureDistanceMm(),
+        };
 
-  switch (GET_OPCODE(com.opcode))
-  {
-  case COM_SET_SPEED:
-    handleComSetSpeed(&com);
-    break;
-  case COM_SET_DIR:
-    handleComSetDir(&com);
-    break;
-  case COM_STOP:
-    handleComStop();
-    break;
-  case COM_GET_STATE:
-    handleComGetState();
-    break;
-  case COM_PRINT_LCD:
-    handleComPrintLcd(&com);
-    break;
-  case COM_CONFIGURE:
-    handleComConfigure(&com);
-    break;
-  default:
-    Serial.write("Invalid opcode: ");
-    Serial.write(com.opcode);
-    Serial.write("\n");
-  }
+        sendResult(&com, STATUS_SUCCESS, &sensorState, sizeof(SensorState));
+        return;
+    }
+    case OP_MOVE_HEAD_SENSOR:
+    {
+        if (!checkArgsCount(&com, 1))
+            return;
+
+        s_Servo.write(com.args[0]);
+        break;
+    }
+    default:
+    {
+        sendResult(&com, STATUS_INV_OPCODE, NULL, 0);
+        return;
+    }
+    }
+
+    sendResult(&com, STATUS_SUCCESS, NULL, 0);
+    // otherwise result already sent by `checkArgsCount` or specific handlers
 }

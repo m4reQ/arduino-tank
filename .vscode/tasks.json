@@ -1,0 +1,23 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Compile Arduino: Current File",
+			"type": "shell",
+			"command": "arduino-cli",
+			"args": [
+				"compile",
+				"-b",
+				"arduino:avr:mega",
+				"${workspaceFolder}/main/main.ino",
+				"-p",
+				"COM10",
+				"-u",
+			],
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			}
+		}
+	]
+}

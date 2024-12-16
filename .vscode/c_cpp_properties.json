@@ -1,0 +1,27 @@
+{
+    "configurations": [
+        {
+            "name": "Win32",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "C:/Users/mmize/Documents/Arduino/libraries/hd44780",
+                "C:/Users/mmize/Documents/Arduino/libraries/Servo/src",
+                "C:/Users/mmize/Documents/Arduino/libraries/HC-SR04/src",
+                "C:/Users/mmize/AppData/Local/Arduino15/packages/arduino/hardware/avr/1.8.6/libraries/Wire/src",
+                "C:/Users/mmize/AppData/Local/Arduino15/packages/arduino/hardware/avr/1.8.6/cores/arduino",
+                "C:/Users/mmize/AppData/Local/Arduino15/packages/arduino/tools/avr-gcc/7.3.0-atmel3.6.1-arduino7/avr/include"
+            ],
+            "defines": [
+                "_DEBUG",
+                "UNICODE",
+                "_UNICODE"
+            ],
+            "windowsSdkVersion": "10.0.22621.0",
+            "compilerPath": "cl.exe",
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "windows-msvc-x64"
+        }
+    ],
+    "version": 4
+}
